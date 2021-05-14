@@ -7,9 +7,7 @@ Alternative Big Query Driver for Metabase (forked from original driver), capable
 
 ### Where to find it
 
-[Click here](https://github.com/pipefy/metabase-bigquery/releases/latest) to view the latest release of the Metabase BigQuery driver; click the link to download `bigquery-alt.metabase-driver.jar`.
-
-You can find past releases of the BigQuery driver [here](https://github.com/pipefy/metabase-bigquery/releases).
+See releases in this repo.
 
 
 ### How to Install it
