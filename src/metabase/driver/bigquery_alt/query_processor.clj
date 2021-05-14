@@ -117,6 +117,7 @@
 ;;; |                                               SQL Driver Methods                                               |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+
 (def ^:private temporal-type-hierarchy
   (-> (make-hierarchy)
       (derive :date :temporal-type)
@@ -183,7 +184,11 @@
   
 (defmethod temporal-type :default
   [x]
-  (:bigquery_alt/temporal-type (meta x)))
+  (if (contains? (meta x) :bigquery_alt/temporal-type)
+    (:bigquery_alt/temporal-type (meta x))
+    (mbql.u/match-one x
+                      [:field-id id]               (temporal-type (qp.store/field id))
+                      [:field-literal _ base-type] (base-type->temporal-type base-type))))
 
 (defn- with-temporal-type {:style/indent 0} [x new-type]
   (if (= (temporal-type x) new-type)
@@ -199,7 +204,7 @@
 
 (defn- throw-unsupported-conversion [from to]
   (throw (ex-info (tru "Cannot convert a {0} to a {1}" from to)
-           {:type error-type/invalid-query})))
+                  {:type error-type/invalid-query})))
 
 (defmethod ->temporal-type [:date LocalTime]           [_ t] (throw-unsupported-conversion "time" "date"))
 (defmethod ->temporal-type [:date OffsetTime]          [_ t] (throw-unsupported-conversion "time" "date"))
@@ -266,7 +271,6 @@
   [target-type [_ t unit]]
   [:absolute-datetime (->temporal-type target-type t) unit])
 
-
 (def ^:private temporal-type->supported-units
   {:timestamp #{:microsecond :millisecond :second :minute :hour :day}
    :datetime  #{:microsecond :millisecond :second :minute :hour :day :week :month :quarter :year}
@@ -321,7 +325,7 @@
       (assert (valid-time-extract-units unit)
               (tru "Cannot extract {0} from a TIME field" unit))
       (recur unit (with-temporal-type (hsql/call :timestamp (hsql/call :datetime "1970-01-01" expr))
-                                      :timestamp)))
+                    :timestamp)))
 
     ;; timestamp and date both support extract()
     :date
@@ -370,7 +374,6 @@
   [_ _ expr]
   (trunc (keyword (format "week(%s)" (name (setting/get-keyword :start-of-week)))) expr))
 
-
 (doseq [[unix-timestamp-type bigquery-fn] {:seconds      :timestamp_seconds
                                            :milliseconds :timestamp_millis
                                            :microseconds :timestamp_micros}]
@@ -411,6 +414,7 @@
 ;;; |                                                Query Processor                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+
 (defn- should-qualify-identifier?
   "Should we qualify an Identifier with the dataset name?
 
@@ -434,16 +438,14 @@
     ;; Only qualify Field identifiers that are qualified by a Table. (e.g. don't qualify stuff inside `CREATE TABLE`
     ;; DDL statements)
     (and (= identifier-type :field)
-    (>= (count components) 2))
+         (>= (count components) 2))
     true))
-
 
 (defmethod sql.qp/->honeysql [:bigquery_alt (class Field)]
   [driver field]
   (let [parent-method (get-method sql.qp/->honeysql [:sql (class Field)])
         identifier    (parent-method driver field)]
     (with-temporal-type identifier (temporal-type field))))
-
 
 (defmethod sql.qp/->honeysql [:bigquery_alt Identifier]
   [_ {:keys [identifier-type components], :as identifier}]
@@ -453,11 +455,9 @@
                           (cons table more)))
 
     (and (= identifier-type :field)
-    (> (count components) 2))
+         (> (count components) 2))
     (update :components (fn [[table & more]]
-                           more))
-  ))
-
+                          more))))
 
 (defmethod sql.qp/->honeysql [:bigquery_alt :field]
   [driver clause]
@@ -575,6 +575,7 @@
                                  alias))
 
 
+
       ;; Add fields form only for fields that weren't specified in :fields clause -- we don't want to include it
       ;; twice, or HoneySQL will barf
       ((partial apply h/merge-select) (for [field-clause breakouts
@@ -601,8 +602,8 @@
 
       (u/prog1 (into [clause-type] (map (partial ->temporal-type target-type)
                                         (cons f args)))
-        (when (not= [clause (meta clause)] [<> (meta <>)])
-          (log/tracef "Coerced -> %s" (binding [*print-meta* true] (pr-str <>))))))
+               (when (not= [clause (meta clause)] [<> (meta <>)])
+                 (log/tracef "Coerced -> %s" (binding [*print-meta* true] (pr-str <>))))))
     clause))
 
 (doseq [filter-type [:between := :!= :> :>= :< :<=]]
@@ -617,6 +618,7 @@
 ;;; |                                Other Driver / SQLDriver Method Implementations                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+
 (defn- interval [amount unit]
   (hsql/raw (format "INTERVAL %d %s" (int amount) (name unit))))
 
@@ -626,7 +628,7 @@
     ;; the first place
     (throw (ex-info (tru "Invalid query: you cannot add a {0} to a {1} column."
                          (name unit) (name t-type))
-             {:type error-type/invalid-query}))))
+                    {:type error-type/invalid-query}))))
 
 ;; We can coerce the HoneySQL form this wraps to whatever we want and generate the appropriate SQL.
 ;; Thus for something like filtering against a relative datetime
@@ -660,7 +662,7 @@
   (let [current-type (temporal-type (:hsql-form add-interval-form))]
     (when (#{[:date :time] [:time :date]} [current-type target-type])
       (throw (ex-info (tru "It doesn''t make sense to convert between DATEs and TIMEs!")
-               {:type error-type/invalid-query}))))
+                      {:type error-type/invalid-query}))))
   (map->AddIntervalForm (update add-interval-form :hsql-form (partial ->temporal-type target-type))))
 
 (defmethod sql.qp/add-interval-honeysql-form :bigquery_alt
