@@ -1,11 +1,14 @@
 (ns metabase.driver.bigquery_alt.query-processor
-  (:require [clojure.string :as str]
+  (:require [buddy.core.codecs :as codecs]
+            [buddy.core.hash :as hash]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
             [honeysql.core :as hsql]
             [honeysql.format :as hformat]
             [honeysql.helpers :as h]
             [java-time :as t]
             [metabase.driver :as driver]
+            [metabase.driver.common :as driver.common]
             [metabase.driver.sql :as sql]
             [metabase.driver.sql.parameters.substitution :as sql.params.substitution]
             [metabase.driver.sql.query-processor :as sql.qp]
@@ -26,6 +29,9 @@
            metabase.driver.common.parameters.FieldFilter
            metabase.util.honeysql_extensions.Identifier))
 
+;; TODO -- I think this only applied to Fields now -- see
+;; https://cloud.google.com/bigquery/docs/reference/standard-sql/data-definition-language. It definitely doesn't apply
+;; to Tables. Not sure about project/dataset identifiers.
 (defn- valid-bigquery-identifier?
   "Is String `s` a valid BigQuery identifier? Identifiers are only allowed to contain letters, numbers, and underscores;
   cannot start with a number; and can be at most 128 characters long."
@@ -141,13 +147,13 @@
     nil))
 
 (defmethod temporal-type (class Field)
-  [{base-type :base_type, database-type :database_type}]
+  [{base-type :base_type, effective-type :effective_type, database-type :database_type}]
   (case database-type
     "TIMESTAMP" :timestamp
     "DATETIME"  :datetime
     "DATE"      :date
     "TIME"      :time
-    (base-type->temporal-type base-type)))
+    (base-type->temporal-type (or effective-type base-type))))
 
 (defmethod temporal-type :absolute-datetime
   [[_ t _]]
@@ -157,16 +163,25 @@
   [_]
   :time)
 
-(defmethod temporal-type :datetime-field
-  [[_ field unit]]
-  ;; date extraction operations result in integers, so the type of the expression shouldn't be a temporal type
-  ;;
-  ;; `:year` is both an extract unit and a truncate unit in terms of `u.date` capabilities, but in MBQL it should be a
-  ;; truncation operation
-  (if ((disj u.date/extract-units :year) unit)
-    nil
-    (temporal-type field)))
+(defmethod temporal-type :field
+  [[_ id-or-name {:keys [base-type temporal-unit], :as opts} :as clause]]
+  (cond
+    (contains? (meta clause) :bigquery_alt/temporal-type)
+    (:bigquery_alt/temporal-type (meta clause))
 
+    ;; date extraction operations result in integers, so the type of the expression shouldn't be a temporal type
+    ;;
+    ;; `:year` is both an extract unit and a truncate unit in terms of `u.date` capabilities, but in MBQL it should be a
+    ;; truncation operation
+    ((disj u.date/extract-units :year) temporal-unit)
+    nil
+
+    (integer? id-or-name)
+    (temporal-type (qp.store/field id-or-name))
+
+    base-type
+    (base-type->temporal-type base-type)))
+  
 (defmethod temporal-type :default
   [x]
   (if (contains? (meta x) :bigquery_alt/temporal-type)
@@ -247,7 +262,7 @@
         bigquery-type
         (do
           (log/tracef "Coercing %s (temporal type = %s) to %s" (binding [*print-meta* true] (pr-str x)) (pr-str (temporal-type x)) bigquery-type)
-          (with-temporal-type (hx/cast bigquery-type (sql.qp/->honeysql :bigquery_alt x)) target-type))
+          (with-temporal-type (hsql/call :cast (sql.qp/->honeysql :bigquery_alt x) (hsql/raw (name bigquery-type))) target-type))
 
         :else
         x))))
@@ -342,9 +357,18 @@
 (defmethod sql.qp/date [:bigquery_alt :quarter-of-year] [_ _ expr] (extract :quarter   expr))
 (defmethod sql.qp/date [:bigquery_alt :year]            [_ _ expr] (trunc   :year      expr))
 
+;; BigQuery mod is a function like mod(x, y) rather than an operator like x mod y
+(defmethod hformat/fn-handler (u/qualified-name ::mod)
+  [_ x y]
+  (format "mod(%s, %s)" (hformat/to-sql x) (hformat/to-sql y)))
+
 (defmethod sql.qp/date [:bigquery_alt :day-of-week]
-  [_ _ expr]
-  (sql.qp/adjust-day-of-week :bigquery_alt (extract :dayofweek expr)))
+  [driver _ expr]
+  (sql.qp/adjust-day-of-week
+   driver
+   (extract :dayofweek expr)
+   (driver.common/start-of-week-offset driver)
+   (partial hsql/call (u/qualified-name ::mod))))
 
 (defmethod sql.qp/date [:bigquery_alt :week]
   [_ _ expr]
@@ -435,11 +459,10 @@
     (update :components (fn [[table & more]]
                           more))))
 
-(doseq [clause-type [:datetime-field :field-literal :field-id]]
-  (defmethod sql.qp/->honeysql [:bigquery_alt clause-type]
-    [driver clause]
-    (let [hsql-form ((get-method sql.qp/->honeysql [:sql clause-type]) driver clause)]
-      (with-temporal-type hsql-form (temporal-type clause)))))
+(defmethod sql.qp/->honeysql [:bigquery_alt :field]
+  [driver clause]
+  (let [hsql-form ((get-method sql.qp/->honeysql [:sql :field]) driver clause)]
+    (with-temporal-type hsql-form (temporal-type clause))))
 
 (defmethod sql.qp/->honeysql [:bigquery_alt :relative-datetime]
   [driver clause]
@@ -448,15 +471,47 @@
     (cond->> ((get-method sql.qp/->honeysql [:sql :relative-datetime]) driver clause)
       t (->temporal-type t))))
 
-;; From the dox: Fields must contain only letters, numbers, and underscores, start with a letter or underscore, and be
-;; at most 128 characters long.
+(defn- short-string-hash
+  "Create a 8-character hash of string `s` to be used as a unique suffix for Field identifiers that could otherwise be
+  ambiguous. For example, `résumé` and `resume` are both valid *table* names, but after converting these to valid
+  *field* identifiers for use as field aliases, we'd end up with `resume_id` for `id` regardless of which table it
+  came from. By appending a unique hash to the generated identifier, we can distinguish the two."
+  [s]
+  (str/join (take 8 (codecs/bytes->hex (hash/md5 s)))))
+
+(defn- substring-first-n-characters
+  "Return substring of `s` with just the first `n` characters."
+  [s n]
+  (subs s 0 (min n (count s))))
+
+(defn- ->valid-field-identifier
+  "Convert field alias `s` to a valid BigQuery field identifier. From the dox: Fields must contain only letters,
+  numbers, and underscores, start with a letter or underscore, and be at most 128 characters long."
+  [s]
+  (let [replaced-str (-> (str/trim s)
+                         u/remove-diacritical-marks
+                         (str/replace #"[^\w\d_]" "_")
+                         (str/replace #"(^\d)" "_$1")
+                         (substring-first-n-characters 128))]
+    (if (= s replaced-str)
+      s
+      ;; if we've done any sort of transformations to the string, append a short hash to the string so it's unique
+      ;; when compared to other strings that may have normalized to the same thing.
+      (str (substring-first-n-characters replaced-str 119) \_ (short-string-hash s)))))
+
 (defmethod driver/format-custom-field-name :bigquery_alt
   [_ custom-field-name]
-  (let [replaced-str (-> (str/trim custom-field-name)
-                         (str/replace #"[^\w\d_]" "_")
-                         (str/replace #"(^\d)" "_$1"))]
-    (subs replaced-str 0 (min 128 (count replaced-str)))))
+  (->valid-field-identifier custom-field-name))
 
+(defmethod sql.qp/field->alias :bigquery_alt
+  [driver field]
+  (->valid-field-identifier ((get-method sql.qp/field->alias :sql) driver field)))
+
+(defmethod sql.qp/prefix-field-alias :bigquery_alt
+  [driver prefix field-alias]
+  (let [s ((get-method sql.qp/prefix-field-alias :sql) driver prefix field-alias)]
+    (->valid-field-identifier s)))
+  
 ;; See:
 ;;
 ;; *  https://cloud.google.com/bigquery/docs/reference/standard-sql/timestamp_functions
@@ -518,6 +573,9 @@
                                                                           :breakout breakout
                                                                           :query    query})))]]
                                  alias))
+
+
+
       ;; Add fields form only for fields that weren't specified in :fields clause -- we don't want to include it
       ;; twice, or HoneySQL will barf
       ((partial apply h/merge-select) (for [field-clause breakouts
