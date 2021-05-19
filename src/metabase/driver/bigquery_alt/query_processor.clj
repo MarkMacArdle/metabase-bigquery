@@ -676,7 +676,6 @@
     :as                                                         outer-query}]
   (let [{dataset-id :schema} (some-> source-table-id qp.store/table)
         {table-name :name} (some-> source-table-id qp.store/table)]
-    (assert (seq dataset-id))
     (binding [sql.qp/*query* (assoc outer-query :dataset-id dataset-id)]
       (let [[sql & params] (->> outer-query
                                 (sql.qp/mbql->honeysql driver)
